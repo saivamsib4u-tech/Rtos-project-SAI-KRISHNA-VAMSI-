@@ -1,0 +1,561 @@
+#include <Wire.h>
+#include <TinyGPS++.h>
+#include <HardwareSerial.h>
+#include <MPU6050.h>
+
+// ======================================================
+// OBJECTS
+// ======================================================
+
+MPU6050 mpu;
+TinyGPSPlus gps;
+
+// UART1 -> GPS
+HardwareSerial GPSserial(1);
+
+// UART2 -> GSM
+HardwareSerial GSMserial(2);
+
+// ======================================================
+// PIN DEFINITIONS
+// ======================================================
+
+#define SW420_PIN     34
+#define BUTTON_PIN    32
+#define BUZZER_PIN    25
+#define LED_PIN       14
+
+// ======================================================
+// VARIABLES
+// ======================================================
+
+float ax, ay, az;
+float total_acc = 0;
+
+int vibration = 0;
+
+float latitude = 0;
+float longitude = 0;
+
+// ======================================================
+// FLAGS
+// ======================================================
+
+volatile bool emergency_flag = false;
+
+volatile bool serious_accident_flag = false;
+
+bool normal_accident_flag = false;
+
+bool minor_vibration_flag = false;
+
+// ======================================================
+// THRESHOLD
+// ======================================================
+
+#define ACC_THRESHOLD 1.05
+
+// ======================================================
+// INTERRUPT FUNCTION
+// ======================================================
+
+void IRAM_ATTR emergencyISR()
+{
+  emergency_flag = true;
+}
+
+// ======================================================
+// SEND SMS FUNCTION
+// ======================================================
+
+void sendSMS(String message)
+{
+  Serial.println("\n================================");
+  Serial.println("SENDING SMS");
+  Serial.println("================================");
+
+  GSMserial.println("AT");
+  delay(1000);
+
+  GSMserial.println("AT+CMGF=1");
+  delay(1000);
+
+  GSMserial.println("AT+CMGS=\"+91XXXXXXXXXX\"");
+  delay(1000);
+
+  GSMserial.print(message);
+
+  delay(500);
+
+  GSMserial.write(26);
+
+  delay(5000);
+
+  Serial.println("SMS SENT SUCCESSFULLY");
+}
+
+// ======================================================
+// GOOGLE MAP LINK
+// ======================================================
+
+String getLocationLink()
+{
+  String link = "https://maps.google.com/?q=";
+
+  link += String(latitude, 6);
+
+  link += ",";
+
+  link += String(longitude, 6);
+
+  return link;
+}
+
+// ======================================================
+// MPU TASK
+// ======================================================
+
+void MPU_Task(void *pvParameters)
+{
+  while (1)
+  {
+    int16_t x, y, z;
+
+    mpu.getAcceleration(&x, &y, &z);
+
+    ax = x / 16384.0;
+    ay = y / 16384.0;
+    az = z / 16384.0;
+
+    total_acc = sqrt(ax * ax + ay * ay + az * az);
+
+    vTaskDelay(200 / portTICK_PERIOD_MS);
+  }
+}
+
+// ======================================================
+// VIBRATION TASK
+// ======================================================
+
+void Vibration_Task(void *pvParameters)
+{
+  while (1)
+  {
+    vibration = digitalRead(SW420_PIN);
+
+    vTaskDelay(50 / portTICK_PERIOD_MS);
+  }
+}
+
+// ======================================================
+// GPS TASK
+// ======================================================
+
+void GPS_Task(void *pvParameters)
+{
+  while (1)
+  {
+    while (GPSserial.available())
+    {
+      gps.encode(GPSserial.read());
+    }
+
+    if (gps.location.isValid())
+    {
+      latitude = gps.location.lat();
+
+      longitude = gps.location.lng();
+    }
+
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+  }
+}
+
+// ======================================================
+// DETECTION TASK
+// ======================================================
+
+void Detection_Task(void *pvParameters)
+{
+  while (1)
+  {
+
+    // ==================================================
+    // SERIOUS ACCIDENT
+    // ==================================================
+
+    if ((total_acc > ACC_THRESHOLD) &&
+        (vibration == HIGH))
+    {
+      Serial.println("\n================================");
+      Serial.println("SERIOUS ACCIDENT CONDITION");
+      Serial.println("================================");
+
+      serious_accident_flag = true;
+
+      // CLEAR OTHER FLAGS
+      normal_accident_flag = false;
+
+      minor_vibration_flag = false;
+
+      vTaskDelay(3000 / portTICK_PERIOD_MS);
+    }
+
+    // ==================================================
+    // ONLY MPU6050
+    // ==================================================
+
+    else if (total_acc > ACC_THRESHOLD)
+    {
+      Serial.println("\n================================");
+      Serial.println("NORMAL ACCIDENT CONDITION");
+      Serial.println("================================");
+
+      normal_accident_flag = true;
+
+      vTaskDelay(3000 / portTICK_PERIOD_MS);
+    }
+
+    // ==================================================
+    // ONLY VIBRATION
+    // ==================================================
+
+    else if (vibration == HIGH)
+    {
+      Serial.println("\n================================");
+      Serial.println("MINOR COLLISION CONDITION");
+      Serial.println("================================");
+
+      minor_vibration_flag = true;
+
+      vTaskDelay(3000 / portTICK_PERIOD_MS);
+    }
+
+    vTaskDelay(200 / portTICK_PERIOD_MS);
+  }
+}
+
+// ======================================================
+// EMERGENCY TASK
+// HIGHEST PRIORITY
+// ======================================================
+
+void Emergency_Task(void *pvParameters)
+{
+  while (1)
+  {
+    if (emergency_flag)
+    {
+      Serial.println("\n================================");
+      Serial.println("EMERGENCY TASK RUNNING");
+      Serial.println("================================");
+
+      // CONTEXT SWITCHING HAPPENS HERE
+
+      digitalWrite(LED_PIN, HIGH);
+
+      digitalWrite(BUZZER_PIN, HIGH);
+
+      String msg = "EMERGENCY ALERT!\n\n";
+
+      msg += "I am not well.\n";
+
+      msg += "I need help immediately.\n\n";
+
+      msg += "Location:\n";
+
+      msg += getLocationLink();
+
+      sendSMS(msg);
+
+      emergency_flag = false;
+
+      vTaskDelay(10000 / portTICK_PERIOD_MS);
+
+      digitalWrite(LED_PIN, LOW);
+
+      digitalWrite(BUZZER_PIN, LOW);
+    }
+
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+  }
+}
+
+// ======================================================
+// SERIOUS ACCIDENT TASK
+// HIGH PRIORITY
+// ======================================================
+
+void SeriousAccident_Task(void *pvParameters)
+{
+  while (1)
+  {
+    if (serious_accident_flag)
+    {
+      Serial.println("\n================================");
+      Serial.println("SERIOUS TASK RUNNING");
+      Serial.println("================================");
+
+      // CONTEXT SWITCHING HAPPENS HERE
+
+      digitalWrite(LED_PIN, HIGH);
+
+      digitalWrite(BUZZER_PIN, HIGH);
+
+      String msg = "ACCIDENT DETECTED!\n\n";
+
+      msg += "Immediate help required.\n\n";
+
+      msg += "Location:\n";
+
+      msg += getLocationLink();
+
+      sendSMS(msg);
+
+      serious_accident_flag = false;
+
+      vTaskDelay(10000 / portTICK_PERIOD_MS);
+
+      digitalWrite(LED_PIN, LOW);
+
+      digitalWrite(BUZZER_PIN, LOW);
+    }
+
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+  }
+}
+
+// ======================================================
+// NORMAL ACCIDENT TASK
+// ======================================================
+
+void NormalAccident_Task(void *pvParameters)
+{
+  while (1)
+  {
+    if (normal_accident_flag)
+    {
+      Serial.println("\nNORMAL ACCIDENT TASK RUNNING");
+
+      String msg = "Accident occurred.\n\n";
+
+      msg += "Location:\n";
+
+      msg += getLocationLink();
+
+      sendSMS(msg);
+
+      normal_accident_flag = false;
+
+      vTaskDelay(10000 / portTICK_PERIOD_MS);
+    }
+
+    vTaskDelay(500 / portTICK_PERIOD_MS);
+  }
+}
+
+// ======================================================
+// MINOR VIBRATION TASK
+// ======================================================
+
+void MinorVibration_Task(void *pvParameters)
+{
+  while (1)
+  {
+    if (minor_vibration_flag)
+    {
+      Serial.println("\nMINOR COLLISION TASK RUNNING");
+
+      String msg = "Minor collision occurred.\n";
+
+      msg += "No major issue detected.";
+
+      sendSMS(msg);
+
+      minor_vibration_flag = false;
+
+      vTaskDelay(5000 / portTICK_PERIOD_MS);
+    }
+
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+  }
+}
+
+// ======================================================
+// SERIAL STUDIO TASK
+// ======================================================
+
+void SerialStudio_Task(void *pvParameters)
+{
+  while (1)
+  {
+    Serial.print("{");
+
+    Serial.print("\"acceleration\":");
+    Serial.print(total_acc);
+
+    Serial.print(",\"vibration\":");
+    Serial.print(vibration);
+
+    Serial.print(",\"latitude\":");
+    Serial.print(latitude, 6);
+
+    Serial.print(",\"longitude\":");
+    Serial.print(longitude, 6);
+
+    Serial.print(",\"emergency\":");
+    Serial.print(emergency_flag);
+
+    Serial.print(",\"serious_accident\":");
+    Serial.print(serious_accident_flag);
+
+    Serial.print(",\"led\":");
+    Serial.print(digitalRead(LED_PIN));
+
+    Serial.print(",\"buzzer\":");
+    Serial.print(digitalRead(BUZZER_PIN));
+
+    Serial.print("}");
+
+    Serial.println();
+
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+  }
+}
+
+// ======================================================
+// SETUP
+// ======================================================
+
+void setup()
+{
+  Serial.begin(115200);
+
+  // MPU6050
+  Wire.begin();
+
+  mpu.initialize();
+
+  // PIN MODES
+  pinMode(SW420_PIN, INPUT);
+
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  pinMode(LED_PIN, OUTPUT);
+
+  // INTERRUPT
+  attachInterrupt(
+    digitalPinToInterrupt(BUTTON_PIN),
+    emergencyISR,
+    FALLING
+  );
+
+  // GPS UART1
+  GPSserial.begin(9600, SERIAL_8N1, 26, 27);
+
+  // GSM UART2
+  GSMserial.begin(9600, SERIAL_8N1, 16, 17);
+
+  // ======================================================
+  // CREATE TASKS
+  // ======================================================
+
+  // SENSOR TASKS
+  xTaskCreate(
+    MPU_Task,
+    "MPU Task",
+    2048,
+    NULL,
+    1,
+    NULL
+  );
+
+  xTaskCreate(
+    Vibration_Task,
+    "Vibration Task",
+    2048,
+    NULL,
+    1,
+    NULL
+  );
+
+  xTaskCreate(
+    GPS_Task,
+    "GPS Task",
+    4096,
+    NULL,
+    1,
+    NULL
+  );
+
+  // DETECTION TASK
+  xTaskCreate(
+    Detection_Task,
+    "Detection Task",
+    4096,
+    NULL,
+    2,
+    NULL
+  );
+
+  // HIGHEST PRIORITY
+  xTaskCreate(
+    Emergency_Task,
+    "Emergency Task",
+    4096,
+    NULL,
+    5,
+    NULL
+  );
+
+  // HIGH PRIORITY
+  xTaskCreate(
+    SeriousAccident_Task,
+    "Serious Accident Task",
+    4096,
+    NULL,
+    4,
+    NULL
+  );
+
+  // MEDIUM PRIORITY
+  xTaskCreate(
+    NormalAccident_Task,
+    "Normal Accident Task",
+    4096,
+    NULL,
+    3,
+    NULL
+  );
+
+  // LOW PRIORITY
+  xTaskCreate(
+    MinorVibration_Task,
+    "Minor Vibration Task",
+    4096,
+    NULL,
+    1,
+    NULL
+  );
+
+  // SERIAL STUDIO TASK
+  xTaskCreate(
+    SerialStudio_Task,
+    "Serial Studio Task",
+    4096,
+    NULL,
+    1,
+    NULL
+  );
+}
+
+// ======================================================
+// LOOP
+// ======================================================
+
+void loop()
+{
+  // EMPTY
+}
